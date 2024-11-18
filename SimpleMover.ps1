@@ -10,8 +10,7 @@
     - Umlautkonvertierung
     - Detaillierte Statusanzeigen
 .NOTES
-    Version: 2.0.0
-    Author: [IHR_NAME]
+    Version: 1.0
     Updated: 2024
 #>
 
