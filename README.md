@@ -50,9 +50,3 @@ MIT License - Verwenden Sie den Code wie Sie möchten!
 ## 🤝 Beitragen
 
 Verbesserungsvorschläge und Pull Requests sind willkommen!
-
-1. Fork das Projekt
-2. Erstelle einen Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit deine Änderungen (`git commit -m 'Add some AmazingFeature'`)
-4. Push zum Branch (`git push origin feature/AmazingFeature`)
-5. Öffne einen Pull Request
