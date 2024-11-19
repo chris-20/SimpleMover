@@ -9,8 +9,10 @@
     - Dateinamensbereinigung
     - Umlautkonvertierung
     - Detaillierte Statusanzeigen
+    - Intelligente Dateiauswahl
+    - Fehlerbehandlung und Logging
 .NOTES
-    Version: 1.0
+    Version: 1.2
     Updated: 2024
 #>
 
@@ -59,13 +61,45 @@ param(
     [switch]$ListBackups,
     
     [Parameter(Mandatory=$false)]
-    [int]$KeepBackupDays = 7
+    [int]$KeepBackupDays = 7,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$EnableLogging
 )
 #EndRegion Parameters
 
 #Region Classes
+class Logger {
+    static [string] $LogPath = ".\FileManager_Logs"
+    static [string] $CurrentLogFile
+
+    static Logger() {
+        [Logger]::CurrentLogFile = Join-Path ([Logger]::LogPath) ("Log_" + (Get-Date -Format "yyyy-MM-dd_HH-mm-ss") + ".txt")
+        if (-not (Test-Path ([Logger]::LogPath))) {
+            New-Item -ItemType Directory -Path ([Logger]::LogPath) | Out-Null
+        }
+    }
+
+    static [void] Log([string]$message, [string]$level = "INFO") {
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "[$timestamp] [$level] $message"
+        Add-Content -Path ([Logger]::CurrentLogFile) -Value $logMessage
+        
+        switch ($level) {
+            "ERROR" { Write-Host $logMessage -ForegroundColor Red }
+            "WARNING" { Write-Host $logMessage -ForegroundColor Yellow }
+            "SUCCESS" { Write-Host $logMessage -ForegroundColor Green }
+            default { Write-Host $logMessage -ForegroundColor Gray }
+        }
+    }
+}
+
 class FileNameCleaner {
     static [string] Clean([string]$fileName, [bool]$umlauts, [bool]$spaces, [bool]$specialChars) {
+        if ([string]::IsNullOrEmpty($fileName)) {
+            throw "Dateiname darf nicht leer sein."
+        }
+
         $result = $fileName
 
         if ($umlauts) {
@@ -81,8 +115,111 @@ class FileNameCleaner {
         if ($specialChars) {
             $result = [RegEx]::Replace($result, '[^a-zA-Z0-9._-]', '')
         }
+
+        # Ensure filename is still valid after cleaning
+        if ([string]::IsNullOrEmpty($result) -or $result -match '^\.+$') {
+            throw "Ungültiger Dateiname nach Bereinigung: $fileName"
+        }
         
         return $result
+    }
+}
+
+class FileSelector {
+    static [array] SelectFiles([string]$path) {
+        if (-not (Test-Path $path)) {
+            [Logger]::Log("Pfad nicht gefunden: $path", "ERROR")
+            return @()
+        }
+
+        $files = Get-ChildItem -Path $path
+        if ($files.Count -eq 0) {
+            [Logger]::Log("Keine Dateien im angegebenen Pfad gefunden: $path", "WARNING")
+            return @()
+        }
+
+        Write-Host "`n📁 Verfügbare Dateien:" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $files.Count; $i++) {
+            $fileSize = [math]::Round($files[$i].Length / 1MB, 2)
+            Write-Host "  [$($i + 1)] $($files[$i].Name) ($fileSize MB)" -ForegroundColor Yellow
+            
+            if ($i -gt 0 -and ($i + 1) % 20 -eq 0 -and $i -lt $files.Count - 1) {
+                Write-Host "  Drücken Sie eine Taste für weitere Dateien..." -ForegroundColor Gray
+                [Console]::ReadKey($true) | Out-Null
+            }
+        }
+
+        Write-Host "`n📝 Dateien auswählen:" -ForegroundColor Cyan
+        Write-Host "  • 'alle' - Alle Dateien auswählen" -ForegroundColor Gray
+        Write-Host "  • '1,3,4' - Einzelne Dateien auswählen" -ForegroundColor Gray
+        Write-Host "  • '1-5' - Bereich auswählen" -ForegroundColor Gray
+        Write-Host "  • '*.txt' - Nach Muster auswählen" -ForegroundColor Gray
+        Write-Host "  • 'q' - Beenden" -ForegroundColor Gray
+        
+        while ($true) {
+            $selection = Read-Host "`nAuswahl"
+            
+            if ($selection.ToLower() -eq 'q') {
+                return @()
+            }
+            
+            if ($selection.ToLower() -eq 'alle') {
+                [Logger]::Log("Alle Dateien ausgewählt", "INFO")
+                return $files
+            }
+
+            # Pattern-basierte Auswahl
+            if ($selection.Contains("*")) {
+                $selectedFiles = $files | Where-Object { $_.Name -like $selection }
+                if ($selectedFiles.Count -gt 0) {
+                    [Logger]::Log("$($selectedFiles.Count) Dateien nach Muster '$selection' ausgewählt", "INFO")
+                    return $selectedFiles
+                }
+                Write-Host "❌ Keine Dateien gefunden, die dem Muster entsprechen." -ForegroundColor Red
+                continue
+            }
+
+            # Bereichsauswahl
+            if ($selection -match '^\d+-\d+$') {
+                $range = $selection -split '-' | ForEach-Object { [int]$_ }
+                if ($range[0] -le $range[1] -and $range[0] -ge 1 -and $range[1] -le $files.Count) {
+                    $selectedFiles = $files[($range[0]-1)..($range[1]-1)]
+                    [Logger]::Log("$($selectedFiles.Count) Dateien im Bereich $($range[0])-$($range[1]) ausgewählt", "INFO")
+                    return $selectedFiles
+                }
+                Write-Host "❌ Ungültiger Bereich. Bitte geben Sie einen gültigen Bereich ein." -ForegroundColor Red
+                continue
+            }
+            
+            # Einzelauswahl
+            try {
+                $selectedIndices = $selection -split ',' | 
+                                  Where-Object { $_ -match '^\s*\d+\s*$' } |
+                                  ForEach-Object { [int]$_.Trim() - 1 }
+                
+                $selectedFiles = $selectedIndices | 
+                               Where-Object { $_ -ge 0 -and $_ -lt $files.Count } |
+                               ForEach-Object { $files[$_] }
+                
+                if ($selectedFiles.Count -gt 0) {
+                    Write-Host "`n✓ Ausgewählte Dateien:" -ForegroundColor Green
+                    $selectedFiles | ForEach-Object {
+                        $fileSize = [math]::Round($_.Length / 1MB, 2)
+                        Write-Host "  • $($_.Name) ($fileSize MB)" -ForegroundColor Yellow
+                    }
+                    [Logger]::Log("$($selectedFiles.Count) Dateien manuell ausgewählt", "INFO")
+                    return $selectedFiles
+                }
+            }
+            catch {
+                [Logger]::Log("Fehler bei der Dateiauswahl: $($_.Exception.Message)", "ERROR")
+            }
+            
+            Write-Host "❌ Ungültige Auswahl. Bitte versuchen Sie es erneut." -ForegroundColor Red
+        }
+
+        # Dieser Code wird nie erreicht, aber PowerShell erfordert einen expliziten Return-Pfad
+        return @()
     }
 }
 
@@ -107,10 +244,12 @@ class BackupManager {
             $files = Get-ChildItem -Path $sourcePath
             $totalFiles = $files.Count
             $currentFile = 0
+            $totalSize = 0
             
             foreach ($file in $files) {
                 $currentFile++
                 $percent = [math]::Round(($currentFile / $totalFiles) * 100)
+                $totalSize += $file.Length
                 
                 Write-Progress -Activity "Erstelle Backup" `
                              -Status "$percent% Complete" `
@@ -125,11 +264,12 @@ class BackupManager {
                 SourcePath = $sourcePath
                 CreatedAt = $timestamp
                 FileCount = $totalFiles
-                TotalSize = ($files | Measure-Object -Property Length -Sum).Sum
+                TotalSize = $totalSize
             } | ConvertTo-Json
             
             Set-Content -Path $infoPath -Value $backupInfo
             
+            [Logger]::Log("Backup erstellt: $backupName mit $totalFiles Dateien", "SUCCESS")
             Write-Host "  ✓ Backup erstellt: $($files.Count) Dateien" -ForegroundColor Green
             Write-Host "  📂 Speicherort: $backupPath" -ForegroundColor Yellow
             Write-Host "╚═════════════════════════════════════╝`n" -ForegroundColor Blue
@@ -137,6 +277,7 @@ class BackupManager {
             return $backupPath
         }
         catch {
+            [Logger]::Log("Backup fehlgeschlagen: $($_.Exception.Message)", "ERROR")
             Write-Host "  ✗ Backup fehlgeschlagen: $($_.Exception.Message)" -ForegroundColor Red
             Write-Host "╚═════════════════════════════════════╝`n" -ForegroundColor Blue
             throw
@@ -174,10 +315,12 @@ class BackupManager {
                 Copy-Item -Path $file.FullName -Destination $destinationPath -ErrorAction Stop
             }
             
+            [Logger]::Log("Backup wiederhergestellt mit $totalFiles Dateien", "SUCCESS")
             Write-Host "  ✓ Wiederherstellung abgeschlossen" -ForegroundColor Green
             Write-Host "  📂 Wiederhergestellte Dateien: $totalFiles" -ForegroundColor Yellow
         }
         catch {
+            [Logger]::Log("Wiederherstellung fehlgeschlagen: $($_.Exception.Message)", "ERROR")
             Write-Host "  ✗ Wiederherstellung fehlgeschlagen: $($_.Exception.Message)" -ForegroundColor Red
             throw
         }
@@ -194,7 +337,7 @@ class BackupManager {
         }
         
         Write-Host "`n=== Verfügbare Backups ===" -ForegroundColor Cyan
-        $backups = Get-ChildItem -Path ([BackupManager]::BackupRoot) -Directory
+        $backups = Get-ChildItem -Path ([BackupManager]::BackupRoot) -Directory | Sort-Object CreationTime -Descending
         
         foreach ($backup in $backups) {
             $infoPath = Join-Path $backup.FullName "backup_info.json"
@@ -203,7 +346,8 @@ class BackupManager {
                 Write-Host "`nBackup: $($backup.Name)" -ForegroundColor Yellow
                 Write-Host "  ├─ Erstellt: $($info.CreatedAt)"
                 Write-Host "  ├─ Dateien: $($info.FileCount)"
-                Write-Host "  └─ Größe: $([math]::Round($info.TotalSize / 1MB, 2)) MB"
+                Write-Host "  ├─ Größe: $([math]::Round($info.TotalSize / 1MB, 2)) MB"
+                Write-Host "  └─ Quellpfad: $($info.SourcePath)"
             }
         }
         Write-Host ""
@@ -220,7 +364,7 @@ class BackupManager {
         
         foreach ($backup in $oldBackups) {
             Remove-Item -Path $backup.FullName -Recurse -Force
-            Write-Host "Altes Backup entfernt: $($backup.Name)" -ForegroundColor Yellow
+            [Logger]::Log("Altes Backup entfernt: $($backup.Name)", "INFO")
         }
     }
 }
@@ -244,6 +388,11 @@ class PreviewManager {
     ) {
         [PreviewManager]::ShowHeader()
         
+        if ($files.Count -eq 0) {
+            [Logger]::Log("Keine Dateien für Vorschau verfügbar", "WARNING")
+            return $false
+        }
+
         $changesFound = $false
         $totalSize = 0
         $affectedFiles = 0
@@ -254,7 +403,13 @@ class PreviewManager {
         foreach ($file in $files) {
             $newName = $file.Name
             if ($clean) {
-                $newName = [FileNameCleaner]::Clean($newName, $umlauts, $spaces, $specialChars)
+                try {
+                    $newName = [FileNameCleaner]::Clean($newName, $umlauts, $spaces, $specialChars)
+                }
+                catch {
+                    [Logger]::Log("Fehler beim Bereinigen von $($file.Name): $($_.Exception.Message)", "ERROR")
+                    continue
+                }
             }
             
             $totalSize += $file.Length
@@ -264,7 +419,8 @@ class PreviewManager {
                 Write-Host "  ├─ Umbenennen:" -ForegroundColor Yellow
                 Write-Host "  │  Von: $($file.Name)" -ForegroundColor Gray
                 Write-Host "  │  Nach: $newName" -ForegroundColor White
-            } else {
+            }
+            else {
                 Write-Host "  ├─ Unverändert: $($file.Name)" -ForegroundColor DarkGray
             }
         }
@@ -276,6 +432,7 @@ class PreviewManager {
         Write-Host "  └─ Geschätzte Dauer: $([math]::Round($totalSize / 1MB / 10, 0)) Sekunden`n"
         
         if (-not $changesFound) {
+            [Logger]::Log("Keine Änderungen notwendig", "INFO")
             Write-Host "ℹ️ Keine Änderungen notwendig!`n" -ForegroundColor Yellow
             return $true
         }
@@ -305,12 +462,18 @@ class PreviewManager {
         $extensions = $files | Group-Object Extension
         Write-Host "`nDateitypen:" -ForegroundColor Yellow
         foreach ($ext in $extensions) {
-            Write-Host "  ├─ $($ext.Name): $($ext.Count) Dateien"
+            $extSize = ($ext.Group | Measure-Object Length -Sum).Sum
+            Write-Host "  ├─ $($ext.Name): $($ext.Count) Dateien ($([math]::Round($extSize / 1MB, 2)) MB)"
         }
         
         Write-Host "`nGrößte Dateien:" -ForegroundColor Yellow
         $files | Sort-Object Length -Descending | Select-Object -First 5 | ForEach-Object {
             Write-Host "  ├─ $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
+        }
+
+        Write-Host "`nÄlteste Dateien:" -ForegroundColor Yellow
+        $files | Sort-Object CreationTime | Select-Object -First 3 | ForEach-Object {
+            Write-Host "  ├─ $($_.Name) (Erstellt: $($_.CreationTime))"
         }
         
         Write-Host "`nDrücken Sie eine Taste für die Rückkehr zur Vorschau..." -ForegroundColor Gray
@@ -323,7 +486,7 @@ class FileOperation {
     static [void] ProcessFiles(
         [string]$source,
         [string]$destination,
-        [string]$pattern,
+        [array]$selectedFiles,
         [bool]$clean,
         [bool]$umlauts,
         [bool]$spaces,
@@ -339,22 +502,23 @@ class FileOperation {
             return
         }
         
-        $files = Get-ChildItem -Path $source -Filter $pattern
-        
         if ($previewMode) {
             $proceed = [PreviewManager]::PreviewChanges(
-                $files, $clean, $umlauts, $spaces, $specialChars, $destination
+                $selectedFiles, $clean, $umlauts, $spaces, $specialChars, $destination
             )
             if (-not $proceed) {
+                [Logger]::Log("Operation durch Benutzer abgebrochen", "INFO")
                 Write-Host "`n❌ Operation abgebrochen!" -ForegroundColor Yellow
                 return
             }
         }
         
-        $totalFiles = $files.Count
+        $totalFiles = $selectedFiles.Count
         $currentFile = 0
+        $successCount = 0
+        $errorCount = 0
         
-        foreach ($file in $files) {
+        foreach ($file in $selectedFiles) {
             $currentFile++
             $progressPercentage = [math]::Round(($currentFile / $totalFiles) * 100)
             
@@ -365,32 +529,57 @@ class FileOperation {
             
             [string]$newName = $file.Name
             if ($clean) {
-                $newName = [FileNameCleaner]::Clean($newName, $umlauts, $spaces, $specialChars)
+                try {
+                    $newName = [FileNameCleaner]::Clean($newName, $umlauts, $spaces, $specialChars)
+                }
+                catch {
+                    [Logger]::Log("Fehler beim Bereinigen von $($file.Name): $($_.Exception.Message)", "ERROR")
+                    $errorCount++
+                    continue
+                }
             }
             
             try {
                 [string]$destinationFile = Join-Path $destination $newName
-                Move-Item -Path $file.FullName -Destination $destinationFile -ErrorAction Stop
+                if (Test-Path $destinationFile) {
+                    $i = 1
+                    $fileNameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($newName)
+                    $extension = [System.IO.Path]::GetExtension($newName)
+                    while (Test-Path $destinationFile) {
+                        $newName = "${fileNameWithoutExt}_${i}${extension}"
+                        $destinationFile = Join-Path $destination $newName
+                        $i++
+                    }
+                    [Logger]::Log("Datei existiert bereits, verwende alternativen Namen: $newName", "WARNING")
+                }
+
+                Copy-Item -Path $file.FullName -Destination $destinationFile -ErrorAction Stop
+                $successCount++
                 Write-Host "[$progressPercentage%] ✓ " -ForegroundColor Green -NoNewline
                 Write-Host "$($file.Name) -> $newName"
+                [Logger]::Log("Datei erfolgreich kopiert: $($file.Name) -> $newName", "SUCCESS")
             }
             catch {
+                $errorCount++
                 Write-Host "[$progressPercentage%] ✗ " -ForegroundColor Red -NoNewline
                 Write-Host "$($file.Name): $($_.Exception.Message)"
+                [Logger]::Log("Fehler beim Kopieren von $($file.Name): $($_.Exception.Message)", "ERROR")
             }
         }
         
         Write-Progress -Activity "Verarbeite Dateien" -Completed
-        [FileOperation]::ShowSummary($currentFile)
+        [FileOperation]::ShowSummary($successCount, $errorCount)
     }
     
     static [bool] ValidatePaths([string]$source, [string]$destination) {
         if (-not (Test-Path $source)) {
+            [Logger]::Log("Quellordner nicht gefunden: $source", "ERROR")
             Write-Host "❌ Quellordner nicht gefunden: $source" -ForegroundColor Red
             return $false
         }
         
         if (-not (Test-Path $destination)) {
+            [Logger]::Log("Erstelle Zielordner: $destination", "INFO")
             Write-Host "📁 Erstelle Zielordner: $destination" -ForegroundColor Yellow
             New-Item -ItemType Directory -Path $destination | Out-Null
         }
@@ -398,17 +587,27 @@ class FileOperation {
         return $true
     }
     
-    static [void] ShowSummary([int]$processedFiles) {
+    static [void] ShowSummary([int]$successCount, [int]$errorCount) {
         Write-Host "`n═══════════════ Zusammenfassung ═══════════════" -ForegroundColor Cyan
-        Write-Host "📊 Verarbeitete Dateien: $processedFiles"
+        Write-Host "📊 Erfolgreich verarbeitet: $successCount" -ForegroundColor Green
+        if ($errorCount -gt 0) {
+            Write-Host "❌ Fehler aufgetreten: $errorCount" -ForegroundColor Red
+        }
         Write-Host "⏱️ Beendet: $(Get-Date -Format 'HH:mm:ss')"
         Write-Host "═════════════════════════════════════════════`n" -ForegroundColor Cyan
+        
+        [Logger]::Log("Verarbeitung abgeschlossen. Erfolge: $successCount, Fehler: $errorCount", "INFO")
     }
 }
-#EndRegion Classes
 
 #Region Main
 try {
+    # Aktiviere Logging wenn gewünscht
+    if ($EnableLogging) {
+        # Logger wird automatisch initialisiert
+        [Logger]::Log("Skript gestartet", "INFO")
+    }
+
     if ($ListBackups) {
         [BackupManager]::ListBackups()
         exit 0
@@ -420,16 +619,35 @@ try {
                        Select-Object -First 1
         if ($latestBackup) {
             [BackupManager]::RestoreBackup($latestBackup.FullName, $DestinationPath)
-        } else {
+        }
+        else {
+            [Logger]::Log("Keine Backups gefunden", "WARNING")
             Write-Host "Keine Backups gefunden!" -ForegroundColor Red
         }
         exit 0
     }
 
     # Interaktiver Modus
-    if (-not $SourcePath -or -not $DestinationPath) {
-        Write-Host "`n📂 Pfade Konfiguration" -ForegroundColor Yellow
-        $SourcePath = Read-Host "Quellpfad eingeben"
+    if (-not $SourcePath) {
+        Write-Host "`n📂 Quellpfad Konfiguration" -ForegroundColor Yellow
+        do {
+            $SourcePath = Read-Host "Quellpfad eingeben"
+            if (-not (Test-Path $SourcePath)) {
+                Write-Host "❌ Pfad nicht gefunden. Bitte geben Sie einen gültigen Pfad ein." -ForegroundColor Red
+            }
+        } while (-not (Test-Path $SourcePath))
+    }
+
+    # Dateiauswahl
+    $selectedFiles = [FileSelector]::SelectFiles($SourcePath)
+    if ($selectedFiles.Count -eq 0) {
+        [Logger]::Log("Keine Dateien ausgewählt, Programm wird beendet", "WARNING")
+        Write-Host "❌ Keine Dateien ausgewählt. Beende Programm." -ForegroundColor Red
+        exit 1
+    }
+
+    if (-not $DestinationPath) {
+        Write-Host "`n📂 Zielpfad Konfiguration" -ForegroundColor Yellow
         $DestinationPath = Read-Host "Zielpfad eingeben"
         
         Write-Host "`n🛠️ Optionen" -ForegroundColor Yellow
@@ -453,21 +671,34 @@ try {
         $backupPath = [BackupManager]::CreateBackup($SourcePath)
     }
 
-    # Dateien verarbeiten
+# Dateien verarbeiten
     [FileOperation]::ProcessFiles(
         $SourcePath,
         $DestinationPath,
-        $FilePattern,
+        $selectedFiles,
         $CleanFileNames,
         $ReplaceUmlauts,
         $RemoveSpaces,
         $RemoveSpecialChars,
         $Preview
     )
+
+    # Abschluss-Log
+    if ($EnableLogging) {
+        [Logger]::Log("Skript erfolgreich beendet", "SUCCESS")
+    }
 }
 catch {
+    [Logger]::Log("Kritischer Fehler: $($_.Exception.Message)", "ERROR")
     Write-Host "`n❌ Unerwarteter Fehler:" -ForegroundColor Red
     Write-Host $_.Exception.Message
+    Write-Host "`nStacktrace:" -ForegroundColor Yellow
+    Write-Host $_.ScriptStackTrace
     exit 1
+}
+finally {
+    if ($EnableLogging) {
+        Write-Host "`nLog-Datei: $([Logger]::CurrentLogFile)" -ForegroundColor Cyan
+    }
 }
 #EndRegion Main
